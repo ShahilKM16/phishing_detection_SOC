@@ -1,11 +1,11 @@
 message = """
-Your password expires today.
-Click here immediately to reset it.
+Congratulations! You are the winner of a free phone.
+Claim your prize immediately or your reward will expire today.
 """
 
 message = message.lower()
 
-total_clues = 0
+detected_categories = []
 
 urgency_words = [
     "urgent",
@@ -59,26 +59,41 @@ print("Checking message...\n")
 for word in urgency_words:
     if word in message:
         print("⚠️ Urgency detected:", word)
-        total_clues += 1
+
+        if "urgency" not in detected_categories:
+            detected_categories.append("urgency")
 
 for word in threat_words:
     if word in message:
         print("⚠️ Threat detected:", word)
-        total_clues += 1
+
+        if "threat" not in detected_categories:
+            detected_categories.append("threat")
+        
 
 for word in credential_words:
     if word in message:
         print("⚠️ Credential request detected:", word)
-        total_clues += 1
+
+        if "credential" not in detected_categories:
+            detected_categories.append("credential")
+        
 
 for word in money_words:
     if word in message:
         print("⚠️ Money-related language detected:", word)
-        total_clues += 1
+
+        if "money" not in detected_categories:
+            detected_categories.append("money")
+        
 
 for word in reward_words:
     if word in message:
         print("⚠️ Reward/scam language detected:", word)
-        total_clues += 1
 
-print("\nTotal suspicious clues:", total_clues)
+        if "reward" not in detected_categories:
+            detected_categories.append("reward")
+        
+
+print("\nDetected categories:", detected_categories)
+print("Number of suspicious categories:", len(detected_categories))
