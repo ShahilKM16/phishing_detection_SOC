@@ -1,99 +1,101 @@
-message = """
+PHISHING_KEYWORDS = {
+    "urgency": [
+        "urgent",
+        "immediately",
+        "action required",
+        "act now",
+        "expires today",
+        "expire today",
+        "within 24 hours",
+    ],
+    "threat": [
+        "suspended",
+        "locked",
+        "disabled",
+        "terminated",
+        "legal action",
+        "account closure",
+    ],
+    "credential": [
+        "password",
+        "login",
+        "sign in",
+        "verify your account",
+        "confirm your identity",
+        "security verification",
+    ],
+    "money": [
+        "payment",
+        "invoice",
+        "refund",
+        "tax",
+        "wire transfer",
+        "bank account",
+        "direct deposit",
+        "direct debit",
+    ],
+    "reward": [
+        "you won",
+        "winner",
+        "prize",
+        "reward",
+        "free",
+        "cash prize",
+        "gift card",
+    ],
+}
+
+
+def normalize_message(message):
+    return message.lower().strip()
+
+
+def detect_keywords(message, keywords):
+    matches = []
+
+    for keyword in keywords:
+        if keyword in message:
+            matches.append(keyword)
+
+    return matches
+
+
+def analyze_message(message):
+    normalized_message = normalize_message(message)
+
+    detected_categories = []
+    matched_indicators = {}
+
+    for category, keywords in PHISHING_KEYWORDS.items():
+        matches = detect_keywords(normalized_message, keywords)
+
+        if matches:
+            detected_categories.append(category)
+            matched_indicators[category] = matches
+
+    return {
+        "detected": len(detected_categories) > 0,
+        "categories": detected_categories,
+        "category_count": len(detected_categories),
+        "matched_indicators": matched_indicators,
+    }
+
+
+if __name__ == "__main__":
+    message = """
 Congratulations! You are the winner of a free phone.
 Claim your prize immediately or your reward will expire today.
 """
 
-message = message.lower()
+    result = analyze_message(message)
 
-detected_categories = []
+    print("Checking message...\n")
 
-urgency_words = [
-    "urgent",
-    "immediately",
-    "action required",
-    "act now",
-    "expires today",
-    "within 24 hours"
-]
+    print("Suspicious:", result["detected"])
+    print("Detected categories:", result["categories"])
+    print("Number of suspicious categories:", result["category_count"])
 
-threat_words = [
-    "suspended",
-    "locked",
-    "disabled",
-    "terminated",
-    "legal action",
-    "account closure"
-]
+    print("\nMatched indicators:")
 
-credential_words = [
-    "password",
-    "login",
-    "sign in",
-    "verify your account",
-    "confirm your identity",
-    "security verification"
-]
-
-money_words = [
-    "payment",
-    "invoice",
-    "refund",
-    "tax",
-    "wire transfer",
-    "bank account",
-    "direct deposit"
-]
-
-reward_words = [
-    "you won",
-    "winner",
-    "prize",
-    "reward",
-    "free",
-    "cash prize",
-    "gift card"
-]
-
-print("Checking message...\n")
-
-for word in urgency_words:
-    if word in message:
-        print("⚠️ Urgency detected:", word)
-
-        if "urgency" not in detected_categories:
-            detected_categories.append("urgency")
-
-for word in threat_words:
-    if word in message:
-        print("⚠️ Threat detected:", word)
-
-        if "threat" not in detected_categories:
-            detected_categories.append("threat")
-        
-
-for word in credential_words:
-    if word in message:
-        print("⚠️ Credential request detected:", word)
-
-        if "credential" not in detected_categories:
-            detected_categories.append("credential")
-        
-
-for word in money_words:
-    if word in message:
-        print("⚠️ Money-related language detected:", word)
-
-        if "money" not in detected_categories:
-            detected_categories.append("money")
-        
-
-for word in reward_words:
-    if word in message:
-        print("⚠️ Reward/scam language detected:", word)
-
-        if "reward" not in detected_categories:
-            detected_categories.append("reward")
-        
-
-print("\nDetected categories:", detected_categories)
-print("Number of suspicious categories:", len(detected_categories))
+    for category, indicators in result["matched_indicators"].items():
+        print(f"- {category}: {', '.join(indicators)}")
