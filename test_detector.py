@@ -1,49 +1,54 @@
-from phishing_detector import analyze_message
+from phishing_detector import analyze_message, analyze_url, extract_urls
 
-test_messages = [
+url_test_messages = [
     {
-        "name": "Prize scam",
+        "name": "HTTP IP phishing URL",
         "message": """
-Congratulations! You are the winner of a free phone.
-Claim your prize immediately.
-""",
+        Verify your account immediately:
+
+        http://192.0.2.55/verify/account
+        """,
     },
+
     {
-        "name": "Password expiry",
+        "name": "Suspicious login URL",
         "message": """
-Your password expires today.
-Sign in immediately to verify your account.
-""",
+        Please access the portal:
+
+        https://example.com/login/verification
+        """,
     },
+
     {
-        "name": "Fake invoice",
+        "name": "Normal documentation URL",
         "message": """
-Your outstanding invoice requires immediate payment.
-""",
+        Python documentation:
+
+        https://docs.python.org/
+        """,
     },
+
     {
-        "name": "Legal threat",
+        "name": "No URL",
         "message": """
-Legal action will be initiated unless you respond immediately.
-""",
-    },
-    {
-        "name": "Normal email",
-        "message": """
-Hi Sarah,
-The project meeting has moved to Wednesday afternoon.
-Please let me know if you can attend.
-Thanks.
-""",
+        Hi team,
+
+        Today's project meeting starts at 2 PM.
+        """,
     },
 ]
 
-for test in test_messages:
+
+for test in url_test_messages:
     print("=" * 60)
-    print("TEST:", test["name"])
+    print("URL TEST:", test["name"])
 
     result = analyze_message(test["message"])
 
-    print("Suspicious:", result["detected"])
-    print("Categories:", result["categories"])
-    print("Indicators:", result["matched_indicators"])
+    print("URLs found:", result["urls_found"])
+    print("Suspicious URLs:", result["suspicious_url_count"])
+
+    for url_result in result["url_analysis"]:
+        print("URL:", url_result["url"])
+        print("Hostname:", url_result["hostname"])
+        print("Indicators:", url_result["indicators"])
