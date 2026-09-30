@@ -1,0 +1,30 @@
+git add phishing_detector.py
+git commit -m "Describe what you added"
+git push
+
+1.Create basic phishing detector (DONE) 
+
+2.Add phishing category detection (DONE) 
+
+3.Add phishing detection functions 
+
+4.Add suspicious URL detection 
+
+5.Add URL risk analysis 
+
+6.Add sender domain analysis 
+
+7.Add attachment detection 
+
+8.Add QR code detection 
+
+9.Add phishing risk scoring 
+
+10.Add phishing report 
+
+11.Add security event logging 
+
+12.Integrate Wazuh SIEM 
+
+13.Add SOC alert automation
+
