@@ -130,11 +130,28 @@ def analyze_message(message):
             detected_categories.append(category)
             matched_indicators[category] = matches
 
-    return {
-        "detected": len(detected_categories) > 0,
+    url_results = []
+    for url in extract_urls(message):
+        url_results.append(analyze_url(url))
+
+    suspicious_urls = [
+        result
+        for result in url_results
+        if result["suspicious"]
+        ]
+    return{
+        "detected":(len(detected_categories) > 0 
+                    or len(suspicious_urls) > 0),
+
         "categories": detected_categories,
+
         "category_count": len(detected_categories),
+
         "matched_indicators": matched_indicators,
+
+        "url_analysis": url_results,
+
+        "suspicious_url_count": len(suspicious_urls),
     }
 
 
@@ -256,6 +273,61 @@ def analyze_html_link(link):
 }
 
 
+def is_ip_address(hostname):
+    """Determine whether a hostname is a raw IP address"""
+
+    if not hostname:
+        return False
+
+    try: 
+        ipaddress.ip_address(hostname)
+        return True
+
+    except ValueError:
+        return False
+
+
+def analyze_url(url):
+    """Analyze a URL for suspicious structural indicators."""
+    hostname = extract_hostname(url)
+
+    indicators = []
+
+    parsed = urlparse(url)
+    
+    # Indicator 1: HTTP instead of HTTPS
+    if parsed.scheme.lower() == "http":
+        indicators.append("uses_http")
+    
+    # Indicator 2: Raw IP address hostname
+    if is_ip_address(hostname):
+        indicators.append("ip_address_hostname")
+
+    if "@" in url:
+        indicators.append("contains_at_symbol")
+
+    if (hostname and not is_ip_address(hostname)
+        and hostname.count(".") >=3 
+    ):
+        indicators.append("many_subdomains")
+
+    matched_words = []
+    lower_url = url.lower()
+    for word in SUSPICIOUS_URL_WORDS:
+        if word in lower_url:
+            matched_words.append(word)
+    if matched_words:
+        indicators.append("suspicious_url_words")
+        
+    
+    return {
+        "url": url,
+        "hostname": hostname,
+        "indicators": indicators,
+        "matched_words": matched_words,
+        "suspicious": len(indicators) > 0,
+    }
+
 # ==========================================
 # SCRIPT EXECUTION
 # Main entry point and sample run
@@ -304,9 +376,53 @@ if __name__ == "__main__":
     for url in extract_urls(message):
         print(f"- {url} -> {extract_hostname(url)}")
 
+    print("\nURL Analysis:")
+
+    for url in extract_urls(message):
+        analysis = analyze_url(url)
+
+        print("\nURL:", analysis["url"])
+        print("Hostname:", analysis["hostname"])
+        print("Indicators:", analysis["indicators"])
+        print("Suspicious:", analysis["suspicious"])
+
+    print ("\nIP Address Tests:")
+    print("192.0.2.55:", is_ip_address("192.0.2.55"))
+    print("paypal.com:", is_ip_address("paypal.com"))
+    print("\n@ Symbol Test:")
+    test_url = "https://paypal.com@evil.com/login"
+    analysis = analyze_url(test_url)
+    print("URL:", test_url)
+    print("Indicators:", analysis["indicators"])
+
+    print("\nSubdomain Test:")
+
+    print("\nURL Keyword Test:")
+    test_url = (
+        "https://secure-login.example.com/verify/account/update"
+    )
+
+    analysis = analyze_url(test_url)
+
+    print("URL:", test_url)
+    print("Indicators:", analysis["indicators"])
+    print("Matched words:", analysis["matched_words"])
+
+
     print("\nChecking message...\n")
 
     result = analyze_message(message)
+
+    print("Suspicious URL Count:",
+    result["suspicious_url_count"]
+    )
+
+    print("\nIntegrated URL Analysis:")
+
+    for url_data in result["url_analysis"]:
+
+        print("\nURL:", url_data["url"])
+        print("Indicators:", url_data["indicators"])
 
     print("Suspicious:", result["detected"])
     print("Detected categories:", result["categories"])
