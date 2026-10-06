@@ -3,6 +3,7 @@
 # Standard library dependencies
 # ==========================================
 import email
+import hashlib
 import ipaddress
 import re
 from html.parser import HTMLParser
@@ -102,6 +103,24 @@ PROTECTED_BRANDS = {
     "apple": "apple.com",
     "netflix": "netflix.com",
 }
+
+# Dangerous attachment file extensions often used in malware delivery
+DANGEROUS_EXTENSIONS = [
+    ".exe",
+    ".vbs",
+    ".js",
+    ".scr",
+    ".iso",
+    ".xlsm",
+    ".docm",
+    ".bat",
+    ".ps1",
+    ".hta",
+    ".jar",
+    ".zip",
+    ".rar",
+    ".7z",
+]
 
 
 # ==========================================
@@ -225,6 +244,69 @@ def check_tech_giant_dmarc(sender_domain, auth_results):
                     "risk_score": 50,
                 }
     return None
+
+
+# ==========================================
+# ATTACHMENT ANALYSIS (PHASE 7)
+# ==========================================
+def analyze_attachments(raw_email_string_or_msg):
+    """Parse email attachments, generate SHA-256 hashes, and assess extension risk."""
+    if isinstance(raw_email_string_or_msg, str):
+        msg = email.message_from_string(raw_email_string_or_msg)
+    else:
+        msg = raw_email_string_or_msg
+
+    attachment_results = []
+
+    for part in msg.walk():
+        content_disposition = str(part.get("Content-Disposition", ""))
+        filename = part.get_filename()
+
+        # Identify attachments via Content-Disposition header or explicit filename
+        if "attachment" in content_disposition or filename:
+            if not filename:
+                filename = "unnamed_attachment"
+
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+
+            sha256_hash = hashlib.sha256(payload).hexdigest()
+            lower_filename = filename.lower()
+
+            indicators = []
+            risk_score = 0
+
+            # 1. Check dangerous extension
+            has_dangerous_extension = any(
+                lower_filename.endswith(ext) for ext in DANGEROUS_EXTENSIONS
+            )
+            if has_dangerous_extension:
+                indicators.append("dangerous_file_extension")
+                risk_score += 40
+
+            # 2. Check double extension trick (e.g., invoice.pdf.exe)
+            filename_parts = lower_filename.split(".")
+            if len(filename_parts) > 2:
+                # Double extension check
+                second_last_ext = "." + filename_parts[-2]
+                last_ext = "." + filename_parts[-1]
+                if last_ext in DANGEROUS_EXTENSIONS and second_last_ext in [".pdf", ".doc", ".docx", ".xlsx", ".txt", ".png", ".jpg"]:
+                    indicators.append("double_extension_spoofing")
+                    risk_score += 30
+
+            attachment_results.append(
+                {
+                    "filename": filename,
+                    "sha256": sha256_hash,
+                    "size_bytes": len(payload),
+                    "indicators": indicators,
+                    "risk_score": risk_score,
+                    "suspicious": risk_score > 0,
+                }
+            )
+
+    return attachment_results
 
 
 # ==========================================
@@ -399,7 +481,7 @@ def calculate_unified_risk(url_analysis, display_mismatch=False):
 
 
 def calculate_phishing_risk(results):
-    """Calculate an overall phishing risk score combining content, links, and header anomalies."""
+    """Calculate an overall phishing risk score combining content, links, headers, and attachments."""
     score = 0
 
     category_weights = {
@@ -416,9 +498,13 @@ def calculate_phishing_risk(results):
     for link in results["link_analysis"]:
         score += link["risk_score"]
 
-    # Incorporate header & brand risks
+    # Header anomalies
     for anomaly in results.get("header_anomalies", []):
         score += anomaly.get("risk_score", 0)
+
+    # Attachment risks
+    for attachment in results.get("attachment_analysis", []):
+        score += attachment.get("risk_score", 0)
 
     if score >= 100:
         severity = "critical"
@@ -443,37 +529,39 @@ def calculate_phishing_risk(results):
     }
 
 
-def analyze_message(message, headers=None):
-    """Evaluate message text, raw URLs, HTML links, and email headers in a unified pipeline."""
+def analyze_message(message, raw_mime_string=None):
+    """Evaluate message text, raw URLs, HTML links, headers, and attachments in a unified pipeline."""
     normalized_message = normalize_message(message)
 
     # 1. Header & Brand Protection Analysis
     header_anomalies = []
     parsed_headers = {}
 
-    if headers:
-        parsed_headers = parse_email_headers(headers)
+    if raw_mime_string:
+        parsed_headers = parse_email_headers(raw_mime_string)
 
-        # Check Display Name Spoofing
         spoof_check = detect_display_name_spoofing(parsed_headers["from"])
         if spoof_check:
             header_anomalies.append(spoof_check)
 
-        # Check Strict DMARC / Auth Failures on Tech Giants
         dmarc_check = check_tech_giant_dmarc(
             parsed_headers["sender_domain"], parsed_headers["auth_results"]
         )
         if dmarc_check:
             header_anomalies.append(dmarc_check)
 
-        # Check Reply-To mismatch
         if parsed_headers["reply_to"] and parsed_headers["sender_domain"] not in parsed_headers["reply_to"]:
             header_anomalies.append({
                 "reason": f"Reply-To address '{parsed_headers['reply_to']}' does not match sender domain '{parsed_headers['sender_domain']}'",
                 "risk_score": 20
             })
 
-    # 2. Text Category Analysis
+    # 2. Attachment Analysis
+    attachment_analysis = []
+    if raw_mime_string:
+        attachment_analysis = analyze_attachments(raw_mime_string)
+
+    # 3. Text Category Analysis
     detected_categories = []
     matched_indicators = {}
 
@@ -483,7 +571,7 @@ def analyze_message(message, headers=None):
             detected_categories.append(category)
             matched_indicators[category] = matches
 
-    # 3. HTML Link Analysis
+    # 4. HTML Link Analysis
     html_links = extract_html_links(message)
     evaluated_links = []
 
@@ -511,8 +599,17 @@ def analyze_message(message, headers=None):
         1 for link in evaluated_links if link["severity"] in ("medium", "high")
     )
 
+    suspicious_attachments_count = sum(
+        1 for att in attachment_analysis if att["suspicious"]
+    )
+
     return {
-        "detected": len(detected_categories) > 0 or suspicious_url_count > 0 or len(header_anomalies) > 0,
+        "detected": (
+            len(detected_categories) > 0
+            or suspicious_url_count > 0
+            or len(header_anomalies) > 0
+            or suspicious_attachments_count > 0
+        ),
         "categories": detected_categories,
         "category_count": len(detected_categories),
         "matched_indicators": matched_indicators,
@@ -520,6 +617,8 @@ def analyze_message(message, headers=None):
         "suspicious_url_count": suspicious_url_count,
         "header_info": parsed_headers,
         "header_anomalies": header_anomalies,
+        "attachment_analysis": attachment_analysis,
+        "suspicious_attachments_count": suspicious_attachments_count,
     }
 
 
@@ -527,36 +626,58 @@ def analyze_message(message, headers=None):
 # SCRIPT EXECUTION & TEST SUITE
 # ==========================================
 if __name__ == "__main__":
-    sample_headers = """From: "Microsoft Security Support" <attacker@fake-security-update.com>
+    # Simulated full MIME multi-part email with malicious double-extension attachment
+    sample_mime_email = """From: "Microsoft Security Support" <attacker@fake-security-update.com>
 Reply-To: harvest@badactor.org
+Subject: Urgent Security Action Required
+Content-Type: multipart/mixed; boundary="BOUNDARY_STRING"
 Authentication-Results: mx.google.com; dmarc=fail header.from=microsoft.com
+
+--BOUNDARY_STRING
+Content-Type: text/html; charset="utf-8"
+
+<html>
+<body>
+<p>Dear customer,</p>
+<p>
+Urgent: Update your Microsoft account credentials immediately to prevent account closure:
+<a href="http://192.0.2.55/login">
+https://login.microsoftonline.com
+</a>
+</p>
+<p>
+Verify billing details at our partner domain:
+<a href="https://paypal-security-update.com/verify">
+https://paypal.com/verify
+</a>
+</p>
+<p>Please review the attached invoice update.</p>
+</body>
+</html>
+
+--BOUNDARY_STRING
+Content-Type: application/octet-stream; name="Invoice_Update_2026.pdf.exe"
+Content-Disposition: attachment; filename="Invoice_Update_2026.pdf.exe"
+Content-Transfer-Encoding: base64
+
+TVpQAAEAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAgAAA4fug4AtAnNIbgAAACACAABL...
+
+--BOUNDARY_STRING--
 """
 
-    sample_email = """
-    <html>
-    <body>
-    <p>Dear customer,</p>
-    <p>
-    Urgent: Update your Microsoft account credentials immediately to prevent account closure:
-    <a href="http://192.0.2.55/login">
-    https://login.microsoftonline.com
-    </a>
-    </p>
-    <p>
-    Verify billing details at our partner domain:
-    <a href="https://paypal-security-update.com/verify">
-    https://paypal.com/verify
-    </a>
-    </p>
-    </body>
-    </html>
-    """
+    print("Running Phishing Engine Analysis (Phase 7 - Attachments)...")
+    print("=" * 60)
 
-    print("Running Phishing Engine Analysis (Phase 5 & 6)...")
-    print("=" * 50)
+    # Extract body from MIME message for text analysis
+    msg = email.message_from_string(sample_mime_email)
+    html_body = ""
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            html_body = part.get_payload(decode=True).decode("utf-8")
 
-    results = analyze_message(sample_email, headers=sample_headers)
-    email_risk = calculate_phishing_risk(results)
+    results = analyze_message(html_body, raw_mime_string=sample_mime_email)
+    phishing_risk = calculate_phishing_risk(results)
 
     print(f"Overall Suspicious Flag : {results['detected']}")
     print(f"Categories Detected     : {results['categories']}")
@@ -565,6 +686,14 @@ Authentication-Results: mx.google.com; dmarc=fail header.from=microsoft.com
         print("\n[!] Header & Brand Impersonation Anomalies:")
         for anomaly in results["header_anomalies"]:
             print(f" - {anomaly['reason']} (+{anomaly['risk_score']} pts)")
+
+    if results["attachment_analysis"]:
+        print(f"\n[!] Attachment Analysis ({results['suspicious_attachments_count']} flagged):")
+        for att in results["attachment_analysis"]:
+            print(f" - Filename   : {att['filename']}")
+            print(f"   SHA-256    : {att['sha256']}")
+            print(f"   Indicators : {att['indicators']}")
+            print(f"   Risk Score : {att['risk_score']}")
 
     print(f"\nLink Risk Analysis ({results['suspicious_url_count']} flagged):")
     for link in results["link_analysis"]:
@@ -578,6 +707,6 @@ Authentication-Results: mx.google.com; dmarc=fail header.from=microsoft.com
     print("\n" + "=" * 30)
     print("FINAL PHISHING RISK ASSESSMENT")
     print("=" * 30)
-    print(f"Total Risk Score : {email_risk['score']}")
-    print(f"Risk Severity    : {email_risk['severity'].upper()}")
-    print(f"Final Verdict    : {email_risk['verdict']}")
+    print(f"Total Risk Score : {phishing_risk['score']}")
+    print(f"Risk Severity    : {phishing_risk['severity'].upper()}")
+    print(f"Final Verdict    : {phishing_risk['verdict']}")
