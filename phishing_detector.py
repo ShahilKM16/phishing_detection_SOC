@@ -102,70 +102,43 @@ def normalize_message(message):
 
 
 def detect_keywords(message, keywords):
-    """Scan normalized text against a list of keyword patterns."""
+    """Scan normalized text against a list of keyword patterns using word boundaries."""
     matches = []
-
     for keyword in keywords:
-        if keyword in message:
+        pattern = r"\b" + re.escape(keyword) + r"\b"
+        if re.search(pattern, message):
             matches.append(keyword)
-
     return matches
 
 
+def is_ip_address(hostname):
+    """Determine whether a hostname is a raw IP address."""
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        return False
+
+
+def extract_hostname(url):
+    """Extract the hostname from a URL."""
+    parsed = urlparse(url)
+    return parsed.hostname
+
+
 # ==========================================
-# CORE ANALYSIS FUNCTIONS
-# Message scanning and URL extraction logic
+# PARSING & EXTRACTION
 # ==========================================
-def analyze_message(message):
-    """Evaluate message text against categorized phishing indicators."""
-    normalized_message = normalize_message(message)
-
-    detected_categories = []
-    matched_indicators = {}
-
-    for category, keywords in PHISHING_KEYWORDS.items():
-        matches = detect_keywords(normalized_message, keywords)
-
-        if matches:
-            detected_categories.append(category)
-            matched_indicators[category] = matches
-
-    url_results = []
-    for url in extract_urls(message):
-        url_results.append(analyze_url(url))
-
-    suspicious_urls = [
-        result
-        for result in url_results
-        if result["suspicious"]
-        ]
-    return{
-        "detected":(len(detected_categories) > 0 
-                    or len(suspicious_urls) > 0),
-
-        "categories": detected_categories,
-
-        "category_count": len(detected_categories),
-
-        "matched_indicators": matched_indicators,
-
-        "url_analysis": url_results,
-
-        "suspicious_url_count": len(suspicious_urls),
-    }
-
-
 def extract_urls(message):
-    """Locate and sanitize URLs found within the message body."""
+    """Locate and sanitize plaintext URLs found within the message body."""
     url_pattern = r'https?://[^\s<>"\']+'
-
     urls = re.findall(url_pattern, message)
 
     cleaned_urls = []
-
     for url in urls:
         url = url.rstrip(".,);!?")
-
         if url not in cleaned_urls:
             cleaned_urls.append(url)
 
@@ -173,94 +146,70 @@ def extract_urls(message):
 
 
 class EmailHTMLLinkParser(HTMLParser):
-    """HTML parser designed to extract hyperlink URLs (href) alongside their associated visible display text from raw email bodies."""
+    """HTML parser designed to extract hyperlink URLs (href) alongside their associated visible display text."""
 
     def __init__(self):
         super().__init__()
-
-        # Stores extracted link objects: [{'href': ..., 'visible_text': ...}]
         self.links = []
-
-        # State tracking variables for the tag currently being processed
         self.current_href = None
         self.current_text = []
 
     def handle_starttag(self, tag, attrs):
-        """Triggered when an opening HTML tag is encountered."""
         if tag == "a":
-            # Convert attributes list of tuples [('href', '...'), ...] into a dictionary
             attributes = dict(attrs)
-
-            # Capture destination URL and reset text accumulator for this tag
             self.current_href = attributes.get("href")
             self.current_text = []
 
     def handle_data(self, data):
-        """Triggered when inner text content between tags is encountered."""
-        # Only accumulate text if we are actively inside an anchor (<a>) tag
         if self.current_href is not None:
             self.current_text.append(data)
 
     def handle_endtag(self, tag):
-        """Triggered when a closing HTML tag is encountered."""
         if tag == "a" and self.current_href is not None:
-            # Combine non-contiguous text chunks (e.g., inner tags or spaces) into a single string
             visible_text = "".join(self.current_text).strip()
-
-            # Record the completed link object
             self.links.append(
                 {
                     "href": self.current_href,
                     "visible_text": visible_text,
                 }
             )
-
-            # Reset tracking state for the next anchor tag
             self.current_href = None
             self.current_text = []
-
 
 
 def extract_html_links(html_message):
     """Safely parse HTML content and extract all hyperlink dictionaries."""
     parser = EmailHTMLLinkParser()
-
     try:
         parser.feed(html_message)
         parser.close()
-
     except Exception:
         return []
-
     return parser.links
 
 
-def extract_hostname(url):
-    """Extract the hostname from a URL."""
-
-    parsed = urlparse(url)
-
-    return parsed.hostname
-
-
+# ==========================================
+# CORE ANALYSIS & RISK SCORING FUNCTIONS
+# ==========================================
 def analyze_html_link(link):
     """Compare a displayed URL with the actual hyperlink destination."""
-    
     href = link["href"]
     visible_text = link["visible_text"].strip()
 
     actual_hostname = extract_hostname(href)
-
     displayed_hostname = None
     display_url_mismatch = False
 
-    if visible_text.lower().startswith(("http://", "https://")):
-        displayed_hostname = extract_hostname(visible_text)
+    if visible_text.lower().startswith(("http://", "https://", "www.")):
+        text_to_parse = visible_text
+        if visible_text.lower().startswith("www."):
+            text_to_parse = "http://" + visible_text
+        displayed_hostname = extract_hostname(text_to_parse)
 
     if (
-    actual_hostname
-    and displayed_hostname
-    and actual_hostname.lower() != displayed_hostname.lower()
+        actual_hostname
+        and displayed_hostname
+        and actual_hostname.lower() != displayed_hostname.lower()
     ):
         display_url_mismatch = True
 
@@ -270,56 +219,37 @@ def analyze_html_link(link):
         "actual_hostname": actual_hostname,
         "displayed_hostname": displayed_hostname,
         "display_url_mismatch": display_url_mismatch,
-}
-
-
-def is_ip_address(hostname):
-    """Determine whether a hostname is a raw IP address"""
-
-    if not hostname:
-        return False
-
-    try: 
-        ipaddress.ip_address(hostname)
-        return True
-
-    except ValueError:
-        return False
+    }
 
 
 def analyze_url(url):
     """Analyze a URL for suspicious structural indicators."""
     hostname = extract_hostname(url)
-
     indicators = []
-
     parsed = urlparse(url)
-    
-    # Indicator 1: HTTP instead of HTTPS
+
     if parsed.scheme.lower() == "http":
         indicators.append("uses_http")
-    
-    # Indicator 2: Raw IP address hostname
+
     if is_ip_address(hostname):
         indicators.append("ip_address_hostname")
 
     if "@" in url:
         indicators.append("contains_at_symbol")
 
-    if (hostname and not is_ip_address(hostname)
-        and hostname.count(".") >=3 
-    ):
+    if hostname and not is_ip_address(hostname) and hostname.count(".") >= 3:
         indicators.append("many_subdomains")
 
     matched_words = []
     lower_url = url.lower()
     for word in SUSPICIOUS_URL_WORDS:
-        if word in lower_url:
+        pattern = r"\b" + re.escape(word) + r"\b"
+        if re.search(pattern, lower_url):
             matched_words.append(word)
+
     if matched_words:
         indicators.append("suspicious_url_words")
-        
-    
+
     return {
         "url": url,
         "hostname": hostname,
@@ -328,12 +258,98 @@ def analyze_url(url):
         "suspicious": len(indicators) > 0,
     }
 
+
+def calculate_unified_risk(url_analysis, display_mismatch=False):
+    """Calculate a single, unified risk score combining structural URL rules and HTML mismatch indicators."""
+    score = 0
+
+    indicator_weights = {
+        "uses_http": 15,
+        "ip_address_hostname": 30,
+        "contains_at_symbol": 25,
+        "many_subdomains": 15,
+        "suspicious_url_words": 10,
+        "display_url_mismatch": 35,
+    }
+
+    for indicator in url_analysis["indicators"]:
+        score += indicator_weights.get(indicator, 0)
+
+    if display_mismatch:
+        score += indicator_weights["display_url_mismatch"]
+
+    if score >= 50:
+        severity = "high"
+    elif score >= 25:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    return {
+        "url": url_analysis["url"],
+        "score": score,
+        "severity": severity,
+    }
+
+
+def analyze_message(message):
+    """Evaluate message text, raw URLs, and HTML links in a unified analysis pipeline."""
+    normalized_message = normalize_message(message)
+
+    # 1. Text category analysis
+    detected_categories = []
+    matched_indicators = {}
+
+    for category, keywords in PHISHING_KEYWORDS.items():
+        matches = detect_keywords(normalized_message, keywords)
+        if matches:
+            detected_categories.append(category)
+            matched_indicators[category] = matches
+
+    # 2. HTML Link analysis (Evaluates structural URL risk + Display mismatch risk)
+    html_links = extract_html_links(message)
+    evaluated_links = []
+
+    for link in html_links:
+        link_info = analyze_html_link(link)
+        url_info = analyze_url(link_info["href"])
+        risk = calculate_unified_risk(
+            url_info, display_mismatch=link_info["display_url_mismatch"]
+        )
+
+        evaluated_links.append(
+            {
+                "href": link_info["href"],
+                "visible_text": link_info["visible_text"],
+                "displayed_hostname": link_info["displayed_hostname"],
+                "actual_hostname": link_info["actual_hostname"],
+                "display_url_mismatch": link_info["display_url_mismatch"],
+                "indicators": url_info["indicators"],
+                "risk_score": risk["score"],
+                "severity": risk["severity"],
+            }
+        )
+
+    suspicious_url_count = sum(
+        1 for link in evaluated_links if link["severity"] in ("medium", "high")
+    )
+
+    return {
+        "detected": len(detected_categories) > 0 or suspicious_url_count > 0,
+        "categories": detected_categories,
+        "category_count": len(detected_categories),
+        "matched_indicators": matched_indicators,
+        "link_analysis": evaluated_links,
+        "suspicious_url_count": suspicious_url_count,
+    }
+
+
 # ==========================================
 # SCRIPT EXECUTION
 # Main entry point and sample run
 # ==========================================
 if __name__ == "__main__":
-    message = """
+    sample_email = """
     <html>
     <body>
 
@@ -348,7 +364,7 @@ if __name__ == "__main__":
 
     <p>
     Urgent: Update your credentials immediately at:
-    <a href= "http://192.0.2.55/login">
+    <a href="http://192.0.2.55/login">
     https://paypal.com/login
     </a>
     </p>
@@ -357,79 +373,24 @@ if __name__ == "__main__":
     </html>
     """
 
-    print("Extracted URLs:", extract_urls(message))
-    print("HTML Links:", extract_html_links(message))
+    print("Running Phishing Detection Analysis...\n" + "=" * 40)
 
-    print("\nHTML Link Analysis:")
+    results = analyze_message(sample_email)
 
-    for link in extract_html_links(message):
-        link_analysis = analyze_html_link(link)
-
-        print("\nVisible text:", link_analysis["visible_text"])
-        print("Actual destination:", link_analysis["href"])
-        print("Displayed hostname:", link_analysis["displayed_hostname"])
-        print("Actual hostname:", link_analysis["actual_hostname"])
-        print("URL mismatch:", link_analysis["display_url_mismatch"])
-
-    print("\nHostnames:")
-
-    for url in extract_urls(message):
-        print(f"- {url} -> {extract_hostname(url)}")
-
-    print("\nURL Analysis:")
-
-    for url in extract_urls(message):
-        analysis = analyze_url(url)
-
-        print("\nURL:", analysis["url"])
-        print("Hostname:", analysis["hostname"])
-        print("Indicators:", analysis["indicators"])
-        print("Suspicious:", analysis["suspicious"])
-
-    print ("\nIP Address Tests:")
-    print("192.0.2.55:", is_ip_address("192.0.2.55"))
-    print("paypal.com:", is_ip_address("paypal.com"))
-    print("\n@ Symbol Test:")
-    test_url = "https://paypal.com@evil.com/login"
-    analysis = analyze_url(test_url)
-    print("URL:", test_url)
-    print("Indicators:", analysis["indicators"])
-
-    print("\nSubdomain Test:")
-
-    print("\nURL Keyword Test:")
-    test_url = (
-        "https://secure-login.example.com/verify/account/update"
+    print(f"Overall Suspicious Flag: {results['detected']}")
+    print(
+        f"Detected Keyword Categories ({results['category_count']}): {results['categories']}"
     )
 
-    analysis = analyze_url(test_url)
+    print("\nMatched Text Indicators:")
+    for category, indicators in results["matched_indicators"].items():
+        print(f" - {category}: {', '.join(indicators)}")
 
-    print("URL:", test_url)
-    print("Indicators:", analysis["indicators"])
-    print("Matched words:", analysis["matched_words"])
-
-
-    print("\nChecking message...\n")
-
-    result = analyze_message(message)
-
-    print("Suspicious URL Count:",
-    result["suspicious_url_count"]
-    )
-
-    print("\nIntegrated URL Analysis:")
-
-    for url_data in result["url_analysis"]:
-
-        print("\nURL:", url_data["url"])
-        print("Indicators:", url_data["indicators"])
-
-    print("Suspicious:", result["detected"])
-    print("Detected categories:", result["categories"])
-    print("Number of suspicious categories:", 
-          result["category_count"])
-
-    print("\nMatched indicators:")
-
-    for category, indicators in result["matched_indicators"].items():
-        print(f"- {category}: {', '.join(indicators)}")
+    print(f"\nLink Risk Analysis ({results['suspicious_url_count']} flagged):")
+    for link in results["link_analysis"]:
+        print(f"\n Destination : {link['href']}")
+        print(f" Display Text: {link['visible_text']}")
+        print(f" Mismatch    : {link['display_url_mismatch']}")
+        print(f" Indicators  : {link['indicators']}")
+        print(f" Risk Score  : {link['risk_score']}")
+        print(f" Severity    : {link['severity'].upper()}")
