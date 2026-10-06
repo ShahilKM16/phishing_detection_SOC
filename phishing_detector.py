@@ -2,6 +2,7 @@
 # IMPORTS
 # Standard library dependencies
 # ==========================================
+import email
 import ipaddress
 import re
 from html.parser import HTMLParser
@@ -91,6 +92,17 @@ SUSPICIOUS_URL_WORDS = [
     "recovery",
 ]
 
+# High-value tech giant targets for brand protection
+PROTECTED_BRANDS = {
+    "microsoft": "microsoft.com",
+    "google": "google.com",
+    "amazon": "amazon.com",
+    "paypal": "paypal.com",
+    "linkedin": "linkedin.com",
+    "apple": "apple.com",
+    "netflix": "netflix.com",
+}
+
 
 # ==========================================
 # HELPER / UTILITY FUNCTIONS
@@ -126,6 +138,93 @@ def extract_hostname(url):
     """Extract the hostname from a URL."""
     parsed = urlparse(url)
     return parsed.hostname
+
+
+# ==========================================
+# HEADER & SENDER ANALYSIS (PHASE 5 & 6)
+# ==========================================
+def parse_email_headers(raw_email_or_headers):
+    """Extract key routing and authentication headers from raw MIME messages."""
+    if isinstance(raw_email_or_headers, str):
+        msg = email.message_from_string(raw_email_or_headers)
+    else:
+        msg = raw_email_or_headers
+
+    from_header = msg.get("From", "")
+    reply_to = msg.get("Reply-To", "")
+    auth_results = msg.get("Authentication-Results", "").lower()
+
+    # Extract sender domain from "From" header
+    sender_domain = ""
+    match = re.search(r"@([\w.-]+)", from_header)
+    if match:
+        sender_domain = match.group(1).lower()
+
+    return {
+        "from": from_header,
+        "reply_to": reply_to,
+        "sender_domain": sender_domain,
+        "auth_results": auth_results,
+    }
+
+
+def detect_display_name_spoofing(from_header):
+    """Flag when a display name claims to be a tech giant but sends from an unofficial domain."""
+    match = re.match(r"^(.*?)\s*<([^>]+)>$", from_header.strip())
+    if not match:
+        return None
+
+    display_name = match.group(1).lower()
+    sender_email = match.group(2).lower()
+    sender_domain = sender_email.split("@")[-1] if "@" in sender_email else ""
+
+    for brand, official_domain in PROTECTED_BRANDS.items():
+        if brand in display_name:
+            if sender_domain != official_domain and not sender_domain.endswith("." + official_domain):
+                return {
+                    "brand": brand,
+                    "reason": f"Display name claims '{brand.title()}' but email sent from '{sender_domain}'",
+                    "risk_score": 45,
+                }
+    return None
+
+
+def detect_brand_typosquatting(domain):
+    """Detect brand string embedding or lookalike domains in links/senders."""
+    if not domain:
+        return None
+
+    domain = domain.lower().strip()
+
+    for brand, official_domain in PROTECTED_BRANDS.items():
+        if domain == official_domain or domain.endswith("." + official_domain):
+            continue
+
+        # Brand string embedded in unofficial domain (e.g., paypal-security.com)
+        if brand in domain:
+            return {
+                "brand": brand,
+                "reason": f"Protected brand '{brand}' embedded in unofficial domain '{domain}'",
+                "risk_score": 35,
+            }
+
+    return None
+
+
+def check_tech_giant_dmarc(sender_domain, auth_results):
+    """Enforce strict auth penalty for spoofed tech giant domains failing DMARC/SPF/DKIM."""
+    if not sender_domain or not auth_results:
+        return None
+
+    for brand, official_domain in PROTECTED_BRANDS.items():
+        if sender_domain == official_domain or sender_domain.endswith("." + official_domain):
+            if "dmarc=fail" in auth_results or "spf=fail" in auth_results or "dkim=fail" in auth_results:
+                return {
+                    "brand": brand,
+                    "reason": f"Sender claims official domain '{sender_domain}' but failed email authentication!",
+                    "risk_score": 50,
+                }
+    return None
 
 
 # ==========================================
@@ -223,7 +322,7 @@ def analyze_html_link(link):
 
 
 def analyze_url(url):
-    """Analyze a URL for suspicious structural indicators."""
+    """Analyze a URL for suspicious structural indicators and typosquatting."""
     hostname = extract_hostname(url)
     indicators = []
     parsed = urlparse(url)
@@ -250,11 +349,17 @@ def analyze_url(url):
     if matched_words:
         indicators.append("suspicious_url_words")
 
+    # Check link destination for brand typosquatting
+    typo_analysis = detect_brand_typosquatting(hostname)
+    if typo_analysis:
+        indicators.append("brand_typosquatting")
+
     return {
         "url": url,
         "hostname": hostname,
         "indicators": indicators,
         "matched_words": matched_words,
+        "typo_analysis": typo_analysis,
         "suspicious": len(indicators) > 0,
     }
 
@@ -270,6 +375,7 @@ def calculate_unified_risk(url_analysis, display_mismatch=False):
         "many_subdomains": 15,
         "suspicious_url_words": 10,
         "display_url_mismatch": 35,
+        "brand_typosquatting": 35,
     }
 
     for indicator in url_analysis["indicators"]:
@@ -292,11 +398,82 @@ def calculate_unified_risk(url_analysis, display_mismatch=False):
     }
 
 
-def analyze_message(message):
-    """Evaluate message text, raw URLs, and HTML links in a unified analysis pipeline."""
+def calculate_phishing_risk(results):
+    """Calculate an overall phishing risk score combining content, links, and header anomalies."""
+    score = 0
+
+    category_weights = {
+        "urgency": 10,
+        "threat": 20,
+        "credential": 20,
+        "money": 15,
+        "reward": 15,
+    }
+
+    for category in results["categories"]:
+        score += category_weights.get(category, 0)
+
+    for link in results["link_analysis"]:
+        score += link["risk_score"]
+
+    # Incorporate header & brand risks
+    for anomaly in results.get("header_anomalies", []):
+        score += anomaly.get("risk_score", 0)
+
+    if score >= 100:
+        severity = "critical"
+    elif score >= 60:
+        severity = "high"
+    elif score >= 30:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    if score >= 60:
+        verdict = "Likely phishing"
+    elif score >= 30:
+        verdict = "Suspicious"
+    else:
+        verdict = "Low risk"
+
+    return {
+        "score": score,
+        "severity": severity,
+        "verdict": verdict,
+    }
+
+
+def analyze_message(message, headers=None):
+    """Evaluate message text, raw URLs, HTML links, and email headers in a unified pipeline."""
     normalized_message = normalize_message(message)
 
-    # 1. Text category analysis
+    # 1. Header & Brand Protection Analysis
+    header_anomalies = []
+    parsed_headers = {}
+
+    if headers:
+        parsed_headers = parse_email_headers(headers)
+
+        # Check Display Name Spoofing
+        spoof_check = detect_display_name_spoofing(parsed_headers["from"])
+        if spoof_check:
+            header_anomalies.append(spoof_check)
+
+        # Check Strict DMARC / Auth Failures on Tech Giants
+        dmarc_check = check_tech_giant_dmarc(
+            parsed_headers["sender_domain"], parsed_headers["auth_results"]
+        )
+        if dmarc_check:
+            header_anomalies.append(dmarc_check)
+
+        # Check Reply-To mismatch
+        if parsed_headers["reply_to"] and parsed_headers["sender_domain"] not in parsed_headers["reply_to"]:
+            header_anomalies.append({
+                "reason": f"Reply-To address '{parsed_headers['reply_to']}' does not match sender domain '{parsed_headers['sender_domain']}'",
+                "risk_score": 20
+            })
+
+    # 2. Text Category Analysis
     detected_categories = []
     matched_indicators = {}
 
@@ -306,7 +483,7 @@ def analyze_message(message):
             detected_categories.append(category)
             matched_indicators[category] = matches
 
-    # 2. HTML Link analysis (Evaluates structural URL risk + Display mismatch risk)
+    # 3. HTML Link Analysis
     html_links = extract_html_links(message)
     evaluated_links = []
 
@@ -335,56 +512,59 @@ def analyze_message(message):
     )
 
     return {
-        "detected": len(detected_categories) > 0 or suspicious_url_count > 0,
+        "detected": len(detected_categories) > 0 or suspicious_url_count > 0 or len(header_anomalies) > 0,
         "categories": detected_categories,
         "category_count": len(detected_categories),
         "matched_indicators": matched_indicators,
         "link_analysis": evaluated_links,
         "suspicious_url_count": suspicious_url_count,
+        "header_info": parsed_headers,
+        "header_anomalies": header_anomalies,
     }
 
 
 # ==========================================
-# SCRIPT EXECUTION
-# Main entry point and sample run
+# SCRIPT EXECUTION & TEST SUITE
 # ==========================================
 if __name__ == "__main__":
+    sample_headers = """From: "Microsoft Security Support" <attacker@fake-security-update.com>
+Reply-To: harvest@badactor.org
+Authentication-Results: mx.google.com; dmarc=fail header.from=microsoft.com
+"""
+
     sample_email = """
     <html>
     <body>
-
     <p>Dear customer,</p>
-
     <p>
-    Please review your statement at:
-    <a href="https://example.com/document">
-    View document
-    </a>
-    </p>
-
-    <p>
-    Urgent: Update your credentials immediately at:
+    Urgent: Update your Microsoft account credentials immediately to prevent account closure:
     <a href="http://192.0.2.55/login">
-    https://paypal.com/login
+    https://login.microsoftonline.com
     </a>
     </p>
-
+    <p>
+    Verify billing details at our partner domain:
+    <a href="https://paypal-security-update.com/verify">
+    https://paypal.com/verify
+    </a>
+    </p>
     </body>
     </html>
     """
 
-    print("Running Phishing Detection Analysis...\n" + "=" * 40)
+    print("Running Phishing Engine Analysis (Phase 5 & 6)...")
+    print("=" * 50)
 
-    results = analyze_message(sample_email)
+    results = analyze_message(sample_email, headers=sample_headers)
+    email_risk = calculate_phishing_risk(results)
 
-    print(f"Overall Suspicious Flag: {results['detected']}")
-    print(
-        f"Detected Keyword Categories ({results['category_count']}): {results['categories']}"
-    )
+    print(f"Overall Suspicious Flag : {results['detected']}")
+    print(f"Categories Detected     : {results['categories']}")
 
-    print("\nMatched Text Indicators:")
-    for category, indicators in results["matched_indicators"].items():
-        print(f" - {category}: {', '.join(indicators)}")
+    if results["header_anomalies"]:
+        print("\n[!] Header & Brand Impersonation Anomalies:")
+        for anomaly in results["header_anomalies"]:
+            print(f" - {anomaly['reason']} (+{anomaly['risk_score']} pts)")
 
     print(f"\nLink Risk Analysis ({results['suspicious_url_count']} flagged):")
     for link in results["link_analysis"]:
@@ -394,3 +574,10 @@ if __name__ == "__main__":
         print(f" Indicators  : {link['indicators']}")
         print(f" Risk Score  : {link['risk_score']}")
         print(f" Severity    : {link['severity'].upper()}")
+
+    print("\n" + "=" * 30)
+    print("FINAL PHISHING RISK ASSESSMENT")
+    print("=" * 30)
+    print(f"Total Risk Score : {email_risk['score']}")
+    print(f"Risk Severity    : {email_risk['severity'].upper()}")
+    print(f"Final Verdict    : {email_risk['verdict']}")
