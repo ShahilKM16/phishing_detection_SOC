@@ -1,6 +1,6 @@
 # ==========================================
 # IMPORTS
-# Standard library dependencies
+# Standard library and third-party dependencies
 # ==========================================
 import email
 import hashlib
@@ -8,6 +8,12 @@ import ipaddress
 import re
 from html.parser import HTMLParser
 from urllib.parse import urlparse
+
+import cv2
+import numpy as np
+from pyzbar.pyzbar import decode as decode_qr
+from PIL import Image
+import io
 
 # ==========================================
 # CONSTANTS & CONFIGURATION
@@ -93,7 +99,6 @@ SUSPICIOUS_URL_WORDS = [
     "recovery",
 ]
 
-# High-value tech giant targets for brand protection
 PROTECTED_BRANDS = {
     "microsoft": "microsoft.com",
     "google": "google.com",
@@ -104,7 +109,6 @@ PROTECTED_BRANDS = {
     "netflix": "netflix.com",
 }
 
-# Dangerous attachment file extensions often used in malware delivery
 DANGEROUS_EXTENSIONS = [
     ".exe",
     ".vbs",
@@ -125,7 +129,6 @@ DANGEROUS_EXTENSIONS = [
 
 # ==========================================
 # HELPER / UTILITY FUNCTIONS
-# Text transformation and basic matching
 # ==========================================
 def normalize_message(message):
     """Clean and standardize input text for processing."""
@@ -173,7 +176,6 @@ def parse_email_headers(raw_email_or_headers):
     reply_to = msg.get("Reply-To", "")
     auth_results = msg.get("Authentication-Results", "").lower()
 
-    # Extract sender domain from "From" header
     sender_domain = ""
     match = re.search(r"@([\w.-]+)", from_header)
     if match:
@@ -219,7 +221,6 @@ def detect_brand_typosquatting(domain):
         if domain == official_domain or domain.endswith("." + official_domain):
             continue
 
-        # Brand string embedded in unofficial domain (e.g., paypal-security.com)
         if brand in domain:
             return {
                 "brand": brand,
@@ -262,7 +263,6 @@ def analyze_attachments(raw_email_string_or_msg):
         content_disposition = str(part.get("Content-Disposition", ""))
         filename = part.get_filename()
 
-        # Identify attachments via Content-Disposition header or explicit filename
         if "attachment" in content_disposition or filename:
             if not filename:
                 filename = "unnamed_attachment"
@@ -277,7 +277,6 @@ def analyze_attachments(raw_email_string_or_msg):
             indicators = []
             risk_score = 0
 
-            # 1. Check dangerous extension
             has_dangerous_extension = any(
                 lower_filename.endswith(ext) for ext in DANGEROUS_EXTENSIONS
             )
@@ -285,10 +284,8 @@ def analyze_attachments(raw_email_string_or_msg):
                 indicators.append("dangerous_file_extension")
                 risk_score += 40
 
-            # 2. Check double extension trick (e.g., invoice.pdf.exe)
             filename_parts = lower_filename.split(".")
             if len(filename_parts) > 2:
-                # Double extension check
                 second_last_ext = "." + filename_parts[-2]
                 last_ext = "." + filename_parts[-1]
                 if last_ext in DANGEROUS_EXTENSIONS and second_last_ext in [".pdf", ".doc", ".docx", ".xlsx", ".txt", ".png", ".jpg"]:
@@ -307,6 +304,67 @@ def analyze_attachments(raw_email_string_or_msg):
             )
 
     return attachment_results
+
+
+# ==========================================
+# QR CODE (QUISHING) ANALYSIS (PHASE 8)
+# ==========================================
+def extract_qr_codes_from_bytes(image_bytes):
+    """Decode QR code URLs from raw image byte streams using PyZBar."""
+    extracted_urls = []
+    try:
+        # Open image with PIL directly
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # PyZBar can decode PIL images directly!
+        decoded_objects = decode_qr(image)
+        for obj in decoded_objects:
+            if obj.type == "QRCODE":
+                qr_data = obj.data.decode("utf-8", errors="ignore").strip()
+                if qr_data.startswith(("http://", "https://")):
+                    extracted_urls.append(qr_data)
+    except Exception as e:
+        print(f"[DEBUG] QR Extraction Error: {e}")
+    return extracted_urls
+
+
+def analyze_email_qr_codes(raw_email_string_or_msg):
+    """Scan all inline and attached images in a MIME message for QR code URLs (Quishing)."""
+    if isinstance(raw_email_string_or_msg, str):
+        msg = email.message_from_string(raw_email_string_or_msg)
+    else:
+        msg = raw_email_string_or_msg
+
+    qr_results = []
+
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        if content_type.startswith("image/"):
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+
+            extracted_urls = extract_qr_codes_from_bytes(payload)
+            filename = part.get_filename() or "inline_image"
+
+            for url in extracted_urls:
+                url_eval = analyze_url(url)
+                risk = calculate_unified_risk(url_eval)
+
+                # Add a base quishing penalty for hiding destinations in QR codes
+                quishing_risk_score = risk["score"] + 25
+
+                qr_results.append(
+                    {
+                        "source_image": filename,
+                        "qr_url": url,
+                        "indicators": url_eval["indicators"] + ["embedded_qr_code"],
+                        "risk_score": quishing_risk_score,
+                        "severity": "high" if quishing_risk_score >= 50 else "medium",
+                    }
+                )
+
+    return qr_results
 
 
 # ==========================================
@@ -431,7 +489,6 @@ def analyze_url(url):
     if matched_words:
         indicators.append("suspicious_url_words")
 
-    # Check link destination for brand typosquatting
     typo_analysis = detect_brand_typosquatting(hostname)
     if typo_analysis:
         indicators.append("brand_typosquatting")
@@ -481,7 +538,7 @@ def calculate_unified_risk(url_analysis, display_mismatch=False):
 
 
 def calculate_phishing_risk(results):
-    """Calculate an overall phishing risk score combining content, links, headers, and attachments."""
+    """Calculate an overall phishing risk score combining content, links, headers, attachments, and QR codes."""
     score = 0
 
     category_weights = {
@@ -498,13 +555,15 @@ def calculate_phishing_risk(results):
     for link in results["link_analysis"]:
         score += link["risk_score"]
 
-    # Header anomalies
     for anomaly in results.get("header_anomalies", []):
         score += anomaly.get("risk_score", 0)
 
-    # Attachment risks
     for attachment in results.get("attachment_analysis", []):
         score += attachment.get("risk_score", 0)
+
+    # QR Code quishing risks
+    for qr in results.get("qr_analysis", []):
+        score += qr.get("risk_score", 0)
 
     if score >= 100:
         severity = "critical"
@@ -530,7 +589,7 @@ def calculate_phishing_risk(results):
 
 
 def analyze_message(message, raw_mime_string=None):
-    """Evaluate message text, raw URLs, HTML links, headers, and attachments in a unified pipeline."""
+    """Evaluate message text, raw URLs, HTML links, headers, attachments, and QR codes in a unified pipeline."""
     normalized_message = normalize_message(message)
 
     # 1. Header & Brand Protection Analysis
@@ -561,7 +620,12 @@ def analyze_message(message, raw_mime_string=None):
     if raw_mime_string:
         attachment_analysis = analyze_attachments(raw_mime_string)
 
-    # 3. Text Category Analysis
+    # 3. QR Code (Quishing) Analysis
+    qr_analysis = []
+    if raw_mime_string:
+        qr_analysis = analyze_email_qr_codes(raw_mime_string)
+
+    # 4. Text Category Analysis
     detected_categories = []
     matched_indicators = {}
 
@@ -571,7 +635,7 @@ def analyze_message(message, raw_mime_string=None):
             detected_categories.append(category)
             matched_indicators[category] = matches
 
-    # 4. HTML Link Analysis
+    # 5. HTML Link Analysis
     html_links = extract_html_links(message)
     evaluated_links = []
 
@@ -609,6 +673,7 @@ def analyze_message(message, raw_mime_string=None):
             or suspicious_url_count > 0
             or len(header_anomalies) > 0
             or suspicious_attachments_count > 0
+            or len(qr_analysis) > 0
         ),
         "categories": detected_categories,
         "category_count": len(detected_categories),
@@ -619,6 +684,7 @@ def analyze_message(message, raw_mime_string=None):
         "header_anomalies": header_anomalies,
         "attachment_analysis": attachment_analysis,
         "suspicious_attachments_count": suspicious_attachments_count,
+        "qr_analysis": qr_analysis,
     }
 
 
@@ -626,83 +692,65 @@ def analyze_message(message, raw_mime_string=None):
 # SCRIPT EXECUTION & TEST SUITE
 # ==========================================
 if __name__ == "__main__":
-    # Simulated full MIME multi-part email with malicious double-extension attachment
-    sample_mime_email = """From: "Microsoft Security Support" <attacker@fake-security-update.com>
-Reply-To: harvest@badactor.org
-Subject: Urgent Security Action Required
-Content-Type: multipart/mixed; boundary="BOUNDARY_STRING"
-Authentication-Results: mx.google.com; dmarc=fail header.from=microsoft.com
+    import io
+    import qrcode
+    from email.message import EmailMessage
 
---BOUNDARY_STRING
-Content-Type: text/html; charset="utf-8"
+    # 1. Generate a sample QR code image in-memory containing a malicious link
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data("https://microsoft-login-update.com/mfa-verify")
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
 
-<html>
-<body>
-<p>Dear customer,</p>
-<p>
-Urgent: Update your Microsoft account credentials immediately to prevent account closure:
-<a href="http://192.0.2.55/login">
-https://login.microsoftonline.com
-</a>
-</p>
-<p>
-Verify billing details at our partner domain:
-<a href="https://paypal-security-update.com/verify">
-https://paypal.com/verify
-</a>
-</p>
-<p>Please review the attached invoice update.</p>
-</body>
-</html>
+    img_byte_arr = io.BytesIO()
+    img.save(img_byte_arr, format="PNG")
+    qr_image_bytes = img_byte_arr.getvalue()
 
---BOUNDARY_STRING
-Content-Type: application/octet-stream; name="Invoice_Update_2026.pdf.exe"
-Content-Disposition: attachment; filename="Invoice_Update_2026.pdf.exe"
-Content-Transfer-Encoding: base64
+    # 2. Construct a multi-part MIME email message with the embedded QR code
+    msg = EmailMessage()
+    msg["From"] = '"Microsoft Security" <update@fake-security-update.com>'
+    msg["To"] = "user@example.com"
+    msg["Subject"] = "Urgent Security Action Required"
+    msg.set_content(
+        "Please scan the attached QR code immediately to verify your password and credentials."
+    )
+    
+    # Attach the generated QR code image
+    msg.add_attachment(
+        qr_image_bytes,
+        maintype="image",
+        subtype="png",
+        filename="security_qr.png",
+    )
 
-TVpQAAEAAAAEAAAA//8AALgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-AAAAAAAAAgAAA4fug4AtAnNIbgAAACACAABL...
+    raw_mime_email = msg.as_string()
 
---BOUNDARY_STRING--
-"""
-
-    print("Running Phishing Engine Analysis (Phase 7 - Attachments)...")
+    print("Running Phishing Engine Analysis (Phase 8 - Quishing Detection)...")
     print("=" * 60)
 
-    # Extract body from MIME message for text analysis
-    msg = email.message_from_string(sample_mime_email)
-    html_body = ""
-    for part in msg.walk():
-        if part.get_content_type() == "text/html":
-            html_body = part.get_payload(decode=True).decode("utf-8")
-
-    results = analyze_message(html_body, raw_mime_string=sample_mime_email)
+    # 3. Pass raw MIME string into the detection pipeline
+    results = analyze_message(
+        "Please scan the attached QR code immediately to verify your password and credentials.",
+        raw_mime_string=raw_mime_email,
+    )
     phishing_risk = calculate_phishing_risk(results)
 
     print(f"Overall Suspicious Flag : {results['detected']}")
     print(f"Categories Detected     : {results['categories']}")
 
-    if results["header_anomalies"]:
-        print("\n[!] Header & Brand Impersonation Anomalies:")
+    if results.get("header_anomalies"):
+        print("\n[!] Header Anomalies:")
         for anomaly in results["header_anomalies"]:
             print(f" - {anomaly['reason']} (+{anomaly['risk_score']} pts)")
 
-    if results["attachment_analysis"]:
-        print(f"\n[!] Attachment Analysis ({results['suspicious_attachments_count']} flagged):")
-        for att in results["attachment_analysis"]:
-            print(f" - Filename   : {att['filename']}")
-            print(f"   SHA-256    : {att['sha256']}")
-            print(f"   Indicators : {att['indicators']}")
-            print(f"   Risk Score : {att['risk_score']}")
-
-    print(f"\nLink Risk Analysis ({results['suspicious_url_count']} flagged):")
-    for link in results["link_analysis"]:
-        print(f"\n Destination : {link['href']}")
-        print(f" Display Text: {link['visible_text']}")
-        print(f" Mismatch    : {link['display_url_mismatch']}")
-        print(f" Indicators  : {link['indicators']}")
-        print(f" Risk Score  : {link['risk_score']}")
-        print(f" Severity    : {link['severity'].upper()}")
+    if results.get("qr_analysis"):
+        print(f"\n[!] Quishing Analysis ({len(results['qr_analysis'])} QR code(s) decoded):")
+        for qr_res in results["qr_analysis"]:
+            print(f" - Source Image : {qr_res['source_image']}")
+            print(f"   Decoded URL  : {qr_res['qr_url']}")
+            print(f"   Indicators   : {qr_res['indicators']}")
+            print(f"   Risk Score   : {qr_res['risk_score']}")
+            print(f"   Severity     : {qr_res['severity'].upper()}")
 
     print("\n" + "=" * 30)
     print("FINAL PHISHING RISK ASSESSMENT")
