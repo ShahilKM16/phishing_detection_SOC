@@ -6,8 +6,11 @@ import email
 import hashlib
 import ipaddress
 import re
+import json
+import os
 from html.parser import HTMLParser
 from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -368,6 +371,152 @@ def analyze_email_qr_codes(raw_email_string_or_msg):
 
 
 # ==========================================
+# PHASE 9: SIEM LOGGING & ANALYST REPORTING
+# ==========================================
+
+def export_json_log(results, risk_assessment, output_file="phishing_events.json"):
+    """
+    Exports structured detection telemetry into a single-line JSON log entry 
+    compatible with Wazuh / Elastic / Splunk active log collectors.
+    """
+    log_event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": "phishing_detection_analysis",
+        "verdict": risk_assessment["verdict"],
+        "severity": risk_assessment["severity"].upper(),
+        "total_risk_score": risk_assessment["score"],
+        "suspicious_flag": results.get("detected", False),
+        "text_categories": results.get("categories", []),
+        "detections": {
+            "header_anomalies": results.get("header_anomalies", []),
+            "link_mismatches": results.get("mismatches", []),
+            "suspicious_urls": results.get("suspicious_urls", []),
+            "attachments": results.get("attachment_analysis", []),
+            "quishing": results.get("qr_analysis", [])
+        }
+    }
+
+    # Append as single-line NDJSON (Newline Delimited JSON) for log collectors
+    with open(output_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(log_event) + "\n")
+
+    print(f"[+] Structured JSON log successfully appended to '{output_file}'")
+    return log_event
+
+
+def generate_analyst_report(results, risk_assessment, output_file="analyst_report.html"):
+    """
+    Generates a standalone, styled HTML investigation report for SOC analysts.
+    """
+    severity = risk_assessment["severity"].upper()
+    score = risk_assessment["score"]
+    verdict = risk_assessment["verdict"]
+
+    # Color tokens based on threat severity
+    color_map = {
+        "CRITICAL": {"badge": "#dc3545", "bg": "#f8d7da", "text": "#721c24"},
+        "HIGH":     {"badge": "#fd7e14", "bg": "#fff3cd", "text": "#856404"},
+        "MEDIUM":   {"badge": "#ffc107", "bg": "#fff3cd", "text": "#856404"},
+        "LOW":      {"badge": "#28a745", "bg": "#d4edda", "text": "#155724"}
+    }
+    colors = color_map.get(severity, color_map["LOW"])
+
+    # Build Header Anomaly Table Rows
+    header_rows = ""
+    for item in results.get("header_anomalies", []):
+        header_rows += f"<tr><td>{item['reason']}</td><td><span class='score'>+{item['risk_score']} pts</span></td></tr>"
+
+    # Build Quishing Table Rows
+    qr_rows = ""
+    for item in results.get("qr_analysis", []):
+        indicators = ", ".join(item.get("indicators", []))
+        qr_rows += f"""
+        <tr>
+            <td><code>{item['source_image']}</code></td>
+            <td><a href='#' style='color:#0d6efd;'>{item['qr_url']}</a></td>
+            <td>{indicators}</td>
+            <td><span class='score'>+{item['risk_score']} pts</span></td>
+        </tr>
+        """
+
+    # Build Attachment Table Rows
+    attachment_rows = ""
+    for att in results.get("attachment_analysis", []):
+        reasons = ", ".join(att.get("reasons", []))
+        attachment_rows += f"""
+        <tr>
+            <td><code>{att['filename']}</code></td>
+            <td><code>{att['sha256']}</code></td>
+            <td>{reasons}</td>
+            <td><span class='score'>+{att['risk_score']} pts</span></td>
+        </tr>
+        """
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Phishing Analysis Report</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f6f9; color: #333; margin: 0; padding: 20px; }}
+        .container {{ max-width: 900px; margin: auto; background: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); padding: 30px; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-bottom: 25px; }}
+        .title {{ font-size: 22px; font-weight: bold; margin: 0; }}
+        .timestamp {{ font-size: 13px; color: #6c757d; }}
+        .summary-card {{ background: {colors['bg']}; border-left: 6px solid {colors['badge']}; color: {colors['text']}; padding: 20px; border-radius: 4px; margin-bottom: 25px; display: flex; justify-content: space-between; align-items: center; }}
+        .badge {{ background: {colors['badge']}; color: #fff; padding: 6px 12px; border-radius: 4px; font-size: 14px; font-weight: bold; text-transform: uppercase; }}
+        .score-box {{ text-align: right; }}
+        .score-val {{ font-size: 28px; font-weight: bold; margin: 0; }}
+        h3 {{ border-bottom: 1px solid #ddd; padding-bottom: 6px; margin-top: 25px; color: #212529; font-size: 16px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }}
+        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #e9ecef; }}
+        th {{ background: #f8f9fa; font-weight: 600; }}
+        code {{ background: #f1f3f5; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 13px; }}
+        .score {{ color: #dc3545; font-weight: bold; }}
+        .empty {{ font-style: italic; color: #888; font-size: 13px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1 class="title">Phishing Incident Triage Report</h1>
+                <div class="timestamp">Generated at {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}</div>
+            </div>
+            <div class="badge">{severity}</div>
+        </div>
+
+        <div class="summary-card">
+            <div>
+                <h2 style="margin: 0; font-size: 20px;">Verdict: {verdict}</h2>
+                <p style="margin: 5px 0 0 0; font-size: 14px;">Categories Flagged: <strong>{', '.join(results.get('categories', ['None']))}</strong></p>
+            </div>
+            <div class="score-box">
+                <div class="score-val">{score}</div>
+                <div style="font-size: 12px; text-transform: uppercase;">Total Risk Score</div>
+            </div>
+        </div>
+
+        <h3>Header & Sender Anomalies</h3>
+        {f"<table><thead><tr><th>Indicator / Anomaly</th><th>Risk</th></tr></thead><tbody>{header_rows}</tbody></table>" if header_rows else "<p class='empty'>No header anomalies detected.</p>"}
+
+        <h3>Quishing / Decoded QR Artifacts</h3>
+        {f"<table><thead><tr><th>Source</th><th>Decoded Destination URL</th><th>Flags</th><th>Risk</th></tr></thead><tbody>{qr_rows}</tbody></table>" if qr_rows else "<p class='empty'>No embedded QR codes detected.</p>"}
+
+        <h3>Attachment Payloads</h3>
+        {f"<table><thead><tr><th>Filename</th><th>SHA-256 Hash</th><th>Indicators</th><th>Risk</th></tr></thead><tbody>{attachment_rows}</tbody></table>" if attachment_rows else "<p class='empty'>No suspicious attachments analyzed.</p>"}
+    </div>
+</body>
+</html>
+"""
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"[+] Human-friendly HTML report generated at '{output_file}'")
+    return output_file
+
+# ==========================================
 # PARSING & EXTRACTION
 # ==========================================
 def extract_urls(message):
@@ -691,12 +840,15 @@ def analyze_message(message, raw_mime_string=None):
 # ==========================================
 # SCRIPT EXECUTION & TEST SUITE
 # ==========================================
+# ==========================================
+# SCRIPT EXECUTION & TEST SUITE
+# ==========================================
 if __name__ == "__main__":
     import io
     import qrcode
     from email.message import EmailMessage
 
-    # 1. Generate a sample QR code image in-memory containing a malicious link
+    # 1. Generate sample QR code
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
     qr.add_data("https://microsoft-login-update.com/mfa-verify")
     qr.make(fit=True)
@@ -706,7 +858,7 @@ if __name__ == "__main__":
     img.save(img_byte_arr, format="PNG")
     qr_image_bytes = img_byte_arr.getvalue()
 
-    # 2. Construct a multi-part MIME email message with the embedded QR code
+    # 2. Build MIME message
     msg = EmailMessage()
     msg["From"] = '"Microsoft Security" <update@fake-security-update.com>'
     msg["To"] = "user@example.com"
@@ -715,7 +867,6 @@ if __name__ == "__main__":
         "Please scan the attached QR code immediately to verify your password and credentials."
     )
     
-    # Attach the generated QR code image
     msg.add_attachment(
         qr_image_bytes,
         maintype="image",
@@ -725,32 +876,20 @@ if __name__ == "__main__":
 
     raw_mime_email = msg.as_string()
 
-    print("Running Phishing Engine Analysis (Phase 8 - Quishing Detection)...")
+    print("Running Phishing Engine Analysis (Phase 9 - SIEM & Analyst Reporting)...")
     print("=" * 60)
 
-    # 3. Pass raw MIME string into the detection pipeline
+    # 3. Execute analysis
     results = analyze_message(
         "Please scan the attached QR code immediately to verify your password and credentials.",
         raw_mime_string=raw_mime_email,
     )
     phishing_risk = calculate_phishing_risk(results)
 
-    print(f"Overall Suspicious Flag : {results['detected']}")
-    print(f"Categories Detected     : {results['categories']}")
-
-    if results.get("header_anomalies"):
-        print("\n[!] Header Anomalies:")
-        for anomaly in results["header_anomalies"]:
-            print(f" - {anomaly['reason']} (+{anomaly['risk_score']} pts)")
-
-    if results.get("qr_analysis"):
-        print(f"\n[!] Quishing Analysis ({len(results['qr_analysis'])} QR code(s) decoded):")
-        for qr_res in results["qr_analysis"]:
-            print(f" - Source Image : {qr_res['source_image']}")
-            print(f"   Decoded URL  : {qr_res['qr_url']}")
-            print(f"   Indicators   : {qr_res['indicators']}")
-            print(f"   Risk Score   : {qr_res['risk_score']}")
-            print(f"   Severity     : {qr_res['severity'].upper()}")
+    # 4. Phase 9 Outputs
+    print("\n[+] Generating Phase 9 Outputs...")
+    export_json_log(results, phishing_risk, output_file="phishing_events.json")
+    generate_analyst_report(results, phishing_risk, output_file="analyst_report.html")
 
     print("\n" + "=" * 30)
     print("FINAL PHISHING RISK ASSESSMENT")
