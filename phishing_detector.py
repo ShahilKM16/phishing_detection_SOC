@@ -8,15 +8,25 @@ import ipaddress
 import re
 import json
 import os
+import base64
+import requests
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 from datetime import datetime, timezone
+from dotenv import load_dotenv, find_dotenv
 
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode as decode_qr
 from PIL import Image
 import io
+
+# Load environment variables from .env file
+load_dotenv(find_dotenv())
+
+VT_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
+#print(f"[DEBUG] Loaded VT API Key: {VT_API_KEY[:5]}..." if VT_API_KEY else "[DEBUG] VT API Key NOT found!")
+
 
 # ==========================================
 # CONSTANTS & CONFIGURATION
@@ -369,6 +379,120 @@ def analyze_email_qr_codes(raw_email_string_or_msg):
 
     return qr_results
 
+# ==========================================
+# PHASE 10: VIRUSTOTAL v3 API INTEGRATION
+# ==========================================
+
+def query_vt_file_hash(sha256_hash):
+    """
+    Queries VirusTotal v3 REST API for an attachment's SHA-256 hash.
+    Returns malicious detection counts and risk score additions.
+    """
+    if not VT_API_KEY:
+        return {"malicious": 0, "risk_score": 0, "status": "skipped_no_api_key"}
+
+    url = f"https://www.virustotal.com/api/v3/files/{sha256_hash}"
+    headers = {"x-apikey": VT_API_KEY}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            stats = response.json()["data"]["attributes"]["last_analysis_stats"]
+            malicious_count = stats.get("malicious", 0)
+            
+            # 15 risk points per malicious vendor detection
+            risk_score = malicious_count * 15
+            
+            return {
+                "malicious": malicious_count,
+                "suspicious": stats.get("suspicious", 0),
+                "risk_score": risk_score,
+                "status": "found"
+            }
+        elif response.status_code == 404:
+            return {"malicious": 0, "risk_score": 0, "status": "hash_not_found"}
+        else:
+            return {"malicious": 0, "risk_score": 0, "status": f"error_{response.status_code}"}
+    except Exception as e:
+        return {"malicious": 0, "risk_score": 0, "status": f"exception_{str(e)}"}
+
+
+def query_vt_url(target_url):
+    """
+    Queries VirusTotal v3 REST API for URL reputation.
+    Uses base64 URL identifier formatting per VT v3 API specs.
+    """
+    if not VT_API_KEY:
+        return {"malicious": 0, "risk_score": 0, "status": "skipped_no_api_key"}
+
+    # Base64 encode URL without padding as required by VT v3 API
+    url_id = base64.urlsafe_b64encode(target_url.encode()).decode().strip("=")
+    api_endpoint = f"https://www.virustotal.com/api/v3/urls/{url_id}"
+    headers = {"x-apikey": VT_API_KEY}
+
+    try:
+        response = requests.get(api_endpoint, headers=headers, timeout=10)
+        if response.status_code == 200:
+            stats = response.json()["data"]["attributes"]["last_analysis_stats"]
+            malicious_count = stats.get("malicious", 0)
+            
+            # 20 risk points per malicious vendor detection
+            risk_score = malicious_count * 20
+            
+            return {
+                "malicious": malicious_count,
+                "suspicious": stats.get("suspicious", 0),
+                "risk_score": risk_score,
+                "status": "found"
+            }
+        elif response.status_code == 404:
+            return {"malicious": 0, "risk_score": 0, "status": "url_not_found"}
+        else:
+            return {"malicious": 0, "risk_score": 0, "status": f"error_{response.status_code}"}
+    except Exception as e:
+        return {"malicious": 0, "risk_score": 0, "status": f"exception_{str(e)}"}
+
+
+def enrich_analysis_with_virustotal(results):
+    """
+    Enriches attachment and URL detections with VirusTotal API intelligence
+    and adjusts risk scores accordingly.
+    """
+    vt_summary = {"attachment_vt_flags": [], "url_vt_flags": [], "total_vt_risk_score": 0}
+
+    # 1. Enrich Attachments
+    for att in results.get("attachment_analysis", []):
+        sha256 = att.get("sha256")
+        if sha256:
+            vt_res = query_vt_file_hash(sha256)
+            att["virustotal"] = vt_res
+            if vt_res.get("malicious", 0) > 0:
+                att["risk_score"] += vt_res["risk_score"]
+                vt_summary["total_vt_risk_score"] += vt_res["risk_score"]
+                vt_summary["attachment_vt_flags"].append({
+                    "filename": att["filename"],
+                    "malicious_engines": vt_res["malicious"]
+                })
+
+    # 2. Enrich Extracted & Decoded QR URLs
+    urls_to_check = set(results.get("suspicious_urls", []))
+    for qr in results.get("qr_analysis", []):
+        if "qr_url" in qr:
+            urls_to_check.add(qr["qr_url"])
+
+    for url in urls_to_check:
+        vt_res = query_vt_url(url)
+        if vt_res.get("malicious", 0) > 0:
+            vt_summary["total_vt_risk_score"] += vt_res["risk_score"]
+            vt_summary["url_vt_flags"].append({
+                "url": url,
+                "malicious_engines": vt_res["malicious"],
+                "added_risk_score": vt_res["risk_score"]
+            })
+
+    results["virustotal_enrichment"] = vt_summary
+    return results
+
 
 # ==========================================
 # PHASE 9: SIEM LOGGING & ANALYST REPORTING
@@ -689,6 +813,7 @@ def calculate_unified_risk(url_analysis, display_mismatch=False):
 def calculate_phishing_risk(results):
     """Calculate an overall phishing risk score combining content, links, headers, attachments, and QR codes."""
     score = 0
+    
 
     category_weights = {
         "urgency": 10,
@@ -713,6 +838,11 @@ def calculate_phishing_risk(results):
     # QR Code quishing risks
     for qr in results.get("qr_analysis", []):
         score += qr.get("risk_score", 0)
+
+    # Phase 10: VirusTotal Threat Intelligence additions
+    vt_enrichment = results.get("virustotal_enrichment", {})
+    vt_score = vt_enrichment.get("total_vt_risk_score", 0)
+    score += vt_score  
 
     if score >= 100:
         severity = "critical"
@@ -876,18 +1006,24 @@ if __name__ == "__main__":
 
     raw_mime_email = msg.as_string()
 
-    print("Running Phishing Engine Analysis (Phase 9 - SIEM & Analyst Reporting)...")
+    print("Running Phishing Engine Analysis (Phase 10 - VirusTotal Threat Intelligence)...")
     print("=" * 60)
 
-    # 3. Execute analysis
+    # 3. Execute core heuristic analysis
     results = analyze_message(
         "Please scan the attached QR code immediately to verify your password and credentials.",
         raw_mime_string=raw_mime_email,
     )
+
+    # 4. Phase 10: Enrich with VirusTotal API
+    print("[+] Querying VirusTotal Threat Intelligence API...")
+    results = enrich_analysis_with_virustotal(results)
+
+    # 5. Calculate total risk score
     phishing_risk = calculate_phishing_risk(results)
 
-    # 4. Phase 9 Outputs
-    print("\n[+] Generating Phase 9 Outputs...")
+    # 6. Generate Phase 9 & 10 SIEM & Analyst outputs
+    print("\n[+] Generating Outputs...")
     export_json_log(results, phishing_risk, output_file="phishing_events.json")
     generate_analyst_report(results, phishing_risk, output_file="analyst_report.html")
 
